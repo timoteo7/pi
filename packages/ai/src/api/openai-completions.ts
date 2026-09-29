@@ -296,6 +296,23 @@ function resolveCacheRetention(cacheRetention?: CacheRetention, env?: ProviderEn
 	return "short";
 }
 
+/**
+ * Yields the chunk already consumed inside the retried request region, then the rest of
+ * `iterator`. Reading that first chunk there is what lets a provider-level failure carried in a
+ * 2xx body be retried instead of ending the turn.
+ */
+async function* prependFirstChunk<T>(
+	first: IteratorResult<T>,
+	iterator: AsyncIterator<T>,
+): AsyncGenerator<T> {
+	if (!first.done) yield first.value;
+	for (;;) {
+		const next = await iterator.next();
+		if (next.done) return;
+		yield next.value;
+	}
+}
+
 export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptions> = (
 	model: Model<"openai-completions">,
 	context: TranscriptContext,
@@ -367,8 +384,25 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
 				maxRetries: 0,
 			};
-			const { data: openaiStream, response } = await retryProviderRequest(
-				() => client.chat.completions.create(params, requestOptions).withResponse(),
+			// A provider can answer 2xx and put the failure in the response body: OpenRouter's
+			// "Provider returned an empty response" (error_type: provider_unavailable) is one, and
+			// free endpoints hit it regularly. The OpenAI SDK raises that while the stream is read,
+			// which happens after `create()` already resolved, so a policy wrapped around the request
+			// alone never sees it and the failure kills the turn with no retry at all.
+			// A body-level failure always arrives as the first stream event, so the first chunk is
+			// read inside the retried region. The SDK raises APIError with `status === undefined`
+			// there, which `isRetryableProviderError` already classifies as retryable, so a fresh
+			// request is issued and the policy applies as configured. Later events are consumed
+			// outside the policy exactly as before, so a mid-stream failure still fails fast instead
+			// of replaying partial output.
+			const { data: openaiStream, response, first, iterator } = await retryProviderRequest(
+				async () => {
+					const { data, response: created } = await client.chat.completions
+						.create(params, requestOptions)
+						.withResponse();
+					const streamIterator = data[Symbol.asyncIterator]();
+					return { data, response: created, first: await streamIterator.next(), iterator: streamIterator };
+				},
 				{
 					maxRetries: options?.maxRetries,
 					maxRetryDelayMs: options?.maxRetryDelayMs,
@@ -550,7 +584,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				return block;
 			};
 
-			for await (const chunk of openaiStream) {
+			for await (const chunk of prependFirstChunk(first, iterator)) {
 				await options?.onProviderStreamEvent?.(chunk, model);
 				if (!chunk || typeof chunk !== "object") continue;
 
